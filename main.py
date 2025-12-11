@@ -3,6 +3,12 @@ import asyncio
 import logging
 import os
 import random
+try:
+	from dotenv import load_dotenv
+	load_dotenv()
+	DOTENV_LOADED = True
+except Exception:
+	DOTENV_LOADED = False
 from datetime import datetime, timedelta
 from typing import Dict, Set, Optional
 
@@ -352,14 +358,15 @@ async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	await try_restrict(chat.id, target.id, until, context.bot)
 	mutes.setdefault(chat.id, {})[target.id] = until.timestamp()
 
-	# schedule unmute
-	async def unmute_job(ctx: ContextTypes.DEFAULT_TYPE):
-		ensure_chat_structs(chat.id)
-		if target.id in mutes.get(chat.id, {}) and mutes[chat.id][target.id] <= datetime.utcnow().timestamp():
-			mutes[chat.id].pop(target.id, None)
-			await try_unrestrict(chat.id, target.id, ctx.bot)
+	# schedule unmute via asyncio task
+	async def unmute_later(chat_id: int, user_id: int, delay: int, bot):
+		await asyncio.sleep(delay)
+		ensure_chat_structs(chat_id)
+		if user_id in mutes.get(chat_id, {}) and mutes[chat_id][user_id] <= datetime.utcnow().timestamp():
+			mutes[chat_id].pop(user_id, None)
+			await try_unrestrict(chat_id, user_id, bot)
 
-	context.job_queue.run_once(unmute_job, when=seconds)
+	asyncio.create_task(unmute_later(chat.id, target.id, seconds, context.bot))
 	await update.message.reply_text(f"{target.mention_html()} замучен на {seconds} секунд.", parse_mode="HTML")
 
 async def unmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,14 +486,24 @@ async def roulette_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		until = datetime.utcnow() + timedelta(seconds=seconds)
 		await try_restrict(chat.id, target.id, until, context.bot)
 		mutes.setdefault(chat.id, {})[target.id] = until.timestamp()
-		context.job_queue.run_once(lambda ctx: asyncio.create_task(try_unrestrict(chat.id, target.id, ctx.bot)), when=seconds)
+		# schedule unmute via asyncio
+		async def _u():
+			await asyncio.sleep(seconds)
+			await try_unrestrict(chat.id, target.id, context.bot)
+
+		asyncio.create_task(_u())
 		await update.message.reply_text(f"Колесо выбрало мут на {seconds} секунд для {target.mention_html()}.", parse_mode="HTML")
 	elif roll == "long_mute":
 		seconds = 300
 		until = datetime.utcnow() + timedelta(seconds=seconds)
 		await try_restrict(chat.id, target.id, until, context.bot)
 		mutes.setdefault(chat.id, {})[target.id] = until.timestamp()
-		context.job_queue.run_once(lambda ctx: asyncio.create_task(try_unrestrict(chat.id, target.id, ctx.bot)), when=seconds)
+		# schedule unmute via asyncio
+		async def _u2():
+			await asyncio.sleep(seconds)
+			await try_unrestrict(chat.id, target.id, context.bot)
+
+		asyncio.create_task(_u2())
 		await update.message.reply_text(f"О, длинный мут: {seconds} секунд для {target.mention_html()}.", parse_mode="HTML")
 	elif roll == "roast":
 		await update.message.reply_text(f"Рулетка выдала ростер: {random.choice(ROASTS)}")
@@ -559,6 +576,23 @@ async def check_silence_job(context: ContextTypes.DEFAULT_TYPE):
 			except Exception:
 				logger.exception("Не удалось отправить агро-фразу в %s", chat_id)
 
+
+async def silence_daemon(app: Application):
+	# background loop to send aggro-phrases to silent chats
+	while True:
+		try:
+			now_ts = datetime.utcnow().timestamp()
+			for chat_id, last_ts in list(last_message_time.items()):
+				if now_ts - last_ts > 300:
+					try:
+						await app.bot.send_message(chat_id, random.choice(AGGRO))
+						last_message_time[chat_id] = now_ts
+					except Exception:
+						logger.exception("Не удалось отправить агро-фразу в %s", chat_id)
+		except Exception:
+			logger.exception("Ошибка в silence_daemon")
+		await asyncio.sleep(60)
+
 async def welcome_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	# ChatMemberHandler handler: greet new members and say goodbye to left
 	result = update.chat_member
@@ -572,11 +606,19 @@ async def welcome_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Startup and main ---
 def main():
+	if DOTENV_LOADED:
+		logger.info("Loaded .env via python-dotenv")
+	else:
+		logger.info("python-dotenv not installed or .env not found; skipping .env load")
 	token = os.getenv("BOT_TOKEN")
 	if not token:
 		logger.error("BOT_TOKEN env var is not set")
 		return
-	app = Application.builder().token(token).build()
+	async def start_backgrounds(application: Application):
+		# start background daemons after app initialization
+		asyncio.create_task(silence_daemon(application))
+
+	app = Application.builder().token(token).post_init(start_backgrounds).build()
 
 	# command handlers
 	app.add_handler(CommandHandler("start", start))
@@ -606,8 +648,7 @@ def main():
 	# chat member updates
 	app.add_handler(ChatMemberHandler(welcome_goodbye, ChatMemberHandler.CHAT_MEMBER))
 
-	# periodic job for silence
-	app.job_queue.run_repeating(check_silence_job, interval=60, first=60)
+	# Note: JobQueue may be unavailable in some installs, use asyncio daemon instead
 
 	logger.info("Starting VanillaReaperBot...")
 	app.run_polling()
