@@ -12,13 +12,14 @@ except Exception:
 from datetime import datetime, timedelta
 from typing import Dict, Set, Optional
 
-from telegram import (Update, ChatPermissions, ChatMember)
+from telegram import (Update, ChatPermissions, ChatMember, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup)
 from telegram.ext import (
 	Application,
 	CommandHandler,
 	ContextTypes,
 	MessageHandler,
 	ChatMemberHandler,
+	CallbackQueryHandler,
 	filters,
 )
 
@@ -185,14 +186,36 @@ def is_admin(user_id: int, chat_id: int) -> bool:
 
 async def try_restrict(chat_id: int, user_id: int, until: Optional[datetime], bot):
 	try:
+		# check bot privileges
+		bot_me = await bot.get_me()
+		try:
+			bot_member = await bot.get_chat_member(chat_id, bot_me.id)
+			can_restrict = getattr(bot_member, "can_restrict_members", False) or bot_member.status == ChatMember.CREATOR
+		except Exception:
+			can_restrict = False
+		if not can_restrict:
+			logger.warning("Bot lacks restrict rights in chat %s", chat_id)
+			return False
 		perms = ChatPermissions(can_send_messages=False)
 		await bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until)
 		logger.info("Restricted %s in %s until %s", user_id, chat_id, until)
+		return True
 	except Exception as e:
 		logger.warning("Failed to restrict %s in %s: %s", user_id, chat_id, e)
+		return False
 
 async def try_unrestrict(chat_id: int, user_id: int, bot):
 	try:
+		# check bot privileges
+		bot_me = await bot.get_me()
+		try:
+			bot_member = await bot.get_chat_member(chat_id, bot_me.id)
+			can_restrict = getattr(bot_member, "can_restrict_members", False) or bot_member.status == ChatMember.CREATOR
+		except Exception:
+			can_restrict = False
+		if not can_restrict:
+			logger.warning("Bot lacks restrict rights in chat %s for unrestrict", chat_id)
+			return False
 		perms = ChatPermissions(
 			can_send_messages=True,
 			can_send_media_messages=True,
@@ -202,33 +225,31 @@ async def try_unrestrict(chat_id: int, user_id: int, bot):
 		)
 		await bot.restrict_chat_member(chat_id, user_id, permissions=perms)
 		logger.info("Unrestricted %s in %s", user_id, chat_id)
+		return True
 	except Exception as e:
 		logger.warning("Failed to unrestrict %s in %s: %s", user_id, chat_id, e)
+		return False
 
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	await update.message.reply_text("VanillaReaperBot at your service. Use /help for commands.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+	# user-friendly help with inline buttons
 	text = (
-		"Команды:\n"
-		"/warn (reply) — выдать предупреждение (3 = бан)\n"
-		"/warns — показать предупреждения\n"
-		"/mute [секунды] (reply) — замутить\n"
-		"/unmute (reply) — снять мут\n"
-		"/kick — выгнать\n"
-		"/ban — забанить\n"
-		"/unban — разбанить\n"
-		"/addadmin, /removeadmin, /setowner, /admins — только владелец\n"
-		"/roast — черный юмор по reply\n"
-		"/vanilla — сарказм и философия\n"
-		"/duel — дуэль двух пользователей\n"
-		"/roulette — рулетка\n"
-		"/search — саркастический обыск\n"
-		"/profile — вывод варнов/мутов/жертвы дня\n"
-		"/sacrifice — выбрать жертву дня (только админ)\n"
+		"VanillaReaperBot — команды:\n\n"
+		"Модерация: /warn /warns /mute /unmute /kick /ban /unban\n"
+		"Развлечения: используйте кнопки ниже или команды /roast /vanilla /duel /roulette\n"
+		"Профиль: /profile (reply) — посмотреть варны/муты\n"
+		"Админ-панель: /addadmin /removeadmin /setowner /admins (только владелец)\n"
 	)
-	await update.message.reply_text(text)
+	keyboard = [
+		[InlineKeyboardButton("🔥 Roast", callback_data="roast"), InlineKeyboardButton("🍦 Vanilla", callback_data="vanilla")],
+		[InlineKeyboardButton("🎲 Roulette", callback_data="roulette"), InlineKeyboardButton("⚔️ Duel (reply)", callback_data="duel")],
+		[InlineKeyboardButton("👤 Profile (reply)", callback_data="profile"), InlineKeyboardButton("ℹ️ BotInfo", callback_data="botinfo")],
+	]
+	reply_markup = InlineKeyboardMarkup(keyboard)
+	await update.message.reply_text(text, reply_markup=reply_markup)
 
 async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	user = update.effective_user
@@ -355,7 +376,9 @@ async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	if is_owner(target.id):
 		return await update.message.reply_text("Нельзя мутить владельца.")
 	until = datetime.utcnow() + timedelta(seconds=seconds)
-	await try_restrict(chat.id, target.id, until, context.bot)
+	ok = await try_restrict(chat.id, target.id, until, context.bot)
+	if not ok:
+		return await update.message.reply_text("У меня нет прав ограничивать пользователей. Сделайте бота админом с правом 'Ban users' / 'Restrict members'.")
 	mutes.setdefault(chat.id, {})[target.id] = until.timestamp()
 
 	# schedule unmute via asyncio task
@@ -399,6 +422,15 @@ async def kick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	target = update.message.reply_to_message.from_user
 	if is_owner(target.id):
 		return await update.message.reply_text("Нельзя кикнуть владельца.")
+	# check bot privileges
+	bot_me = await context.bot.get_me()
+	try:
+		bot_member = await context.bot.get_chat_member(chat.id, bot_me.id)
+		can_restrict = getattr(bot_member, "can_restrict_members", False) or bot_member.status == ChatMember.CREATOR
+	except Exception:
+		can_restrict = False
+	if not can_restrict:
+		return await update.message.reply_text("У меня нет прав кикать/банить пользователей. Сделайте бота админом с правом 'Ban users'.")
 	try:
 		await context.bot.ban_chat_member(chat.id, target.id)
 		await context.bot.unban_chat_member(chat.id, target.id)
@@ -417,6 +449,15 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	target = update.message.reply_to_message.from_user
 	if is_owner(target.id):
 		return await update.message.reply_text("Нельзя банить владельца.")
+	# check bot privileges
+	bot_me = await context.bot.get_me()
+	try:
+		bot_member = await context.bot.get_chat_member(chat.id, bot_me.id)
+		can_restrict = getattr(bot_member, "can_restrict_members", False) or bot_member.status == ChatMember.CREATOR
+	except Exception:
+		can_restrict = False
+	if not can_restrict:
+		return await update.message.reply_text("У меня нет прав банить пользователей. Сделайте бота админом с правом 'Ban users'.")
 	try:
 		await context.bot.ban_chat_member(chat.id, target.id)
 		banned.setdefault(chat.id, set()).add(target.id)
@@ -432,6 +473,15 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		return await update.message.reply_text("Только админы могут разбанить.")
 	if not context.args:
 		return await update.message.reply_text("Укажи ID пользователя: /unban <user_id>")
+	# check bot privileges
+	bot_me = await context.bot.get_me()
+	try:
+		bot_member = await context.bot.get_chat_member(chat.id, bot_me.id)
+		can_restrict = getattr(bot_member, "can_restrict_members", False) or bot_member.status == ChatMember.CREATOR
+	except Exception:
+		can_restrict = False
+	if not can_restrict:
+		return await update.message.reply_text("У меня нет прав разбанивать пользователей. Сделайте бота админом с правом 'Ban users'.")
 	try:
 		uid = int(context.args[0])
 		await context.bot.unban_chat_member(chat.id, uid)
@@ -448,6 +498,27 @@ async def roast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		target = update.effective_user
 	text = random.choice(ROASTS)
 	await update.message.reply_text(f"{target.mention_html()} — {text}", parse_mode="HTML")
+
+
+async def botinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+	chat = update.effective_chat
+	bot_me = await context.bot.get_me()
+	info_lines = [f"Бот: @{bot_me.username} (id={bot_me.id})"]
+	try:
+		member = await context.bot.get_chat_member(chat.id, bot_me.id)
+		info_lines.append(f"Статус бота в чате: {member.status}")
+		flags = []
+		if getattr(member, 'can_restrict_members', False):
+			flags.append('can_restrict_members')
+		if getattr(member, 'can_delete_messages', False):
+			flags.append('can_delete_messages')
+		if getattr(member, 'can_promote_members', False):
+			flags.append('can_promote_members')
+		if flags:
+			info_lines.append('Права: ' + ', '.join(flags))
+	except Exception:
+		info_lines.append('Не удалось получить статус бота в этом чате.')
+	await update.message.reply_text('\n'.join(info_lines))
 
 async def vanilla_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	text = random.choice(VANILLA)
@@ -536,6 +607,25 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	text += f"Жертва дня: {('Да' if victim == target.id else 'Нет')}"
 	await update.message.reply_text(text, parse_mode="HTML")
 
+
+async def commands_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+	# handle inline button presses
+	query = update.callback_query
+	await query.answer()
+	data = query.data
+	if data == 'roast':
+		await query.message.reply_text(random.choice(ROASTS))
+	elif data == 'vanilla':
+		await query.message.reply_text(random.choice(VANILLA))
+	elif data == 'roulette':
+		# invoke roulette on behalf of user
+		fake_update = update
+		await roulette_cmd(fake_update, context)
+	elif data == 'profile':
+		# ask user to reply to someone for profile
+		await query.message.reply_text('Используйте /profile в reply на сообщение пользователя, чтобы увидеть профиль.')
+
+
 async def sacrifice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	chat = update.effective_chat
 	user = update.effective_user
@@ -554,6 +644,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	msg = update.message
 	if not msg:
 		return
+	# ignore bots
+	if msg.from_user and msg.from_user.is_bot:
+		return
 	chat_id = update.effective_chat.id
 	ensure_chat_structs(chat_id)
 	uid = msg.from_user.id
@@ -561,9 +654,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	recent_activity[chat_id].add(uid)
 	last_message_time[chat_id] = datetime.utcnow().timestamp()
 
-	# auto replies to mentions
-	text = (msg.text or msg.caption or "").lower()
-	if context.bot.username.lower() in text or msg.reply_to_message and msg.reply_to_message.from_user.id == (await context.bot.get_me()).id:
+	# auto replies: only on mention, reply-to-bot, or in private chat
+	text = (msg.text or msg.caption or "")
+	is_private = update.effective_chat.type == 'private'
+	bot_username = globals().get('BOT_USERNAME')
+	mentioned = False
+	if msg.entities:
+		for ent in msg.entities:
+			if ent.type in ('mention', 'text_mention'):
+				ent_text = text[ent.offset: ent.offset + ent.length]
+				if bot_username and bot_username.lower() in ent_text.lower():
+					mentioned = True
+					break
+	if is_private or mentioned or (msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == (await context.bot.get_me()).id):
 		await msg.reply_text(random.choice(VANILLA + AGGRO))
 
 async def check_silence_job(context: ContextTypes.DEFAULT_TYPE):
@@ -593,6 +696,7 @@ async def silence_daemon(app: Application):
 			logger.exception("Ошибка в silence_daemon")
 		await asyncio.sleep(60)
 
+
 async def welcome_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	# ChatMemberHandler handler: greet new members and say goodbye to left
 	result = update.chat_member
@@ -615,8 +719,29 @@ def main():
 		logger.error("BOT_TOKEN env var is not set")
 		return
 	async def start_backgrounds(application: Application):
-		# start background daemons after app initialization
-		asyncio.create_task(silence_daemon(application))
+			# start background daemons after app initialization
+			asyncio.create_task(silence_daemon(application))
+			# register visible commands for users
+			try:
+				commands = [
+					BotCommand("start", "Запуск бота"),
+					BotCommand("help", "Список команд"),
+					BotCommand("roast", "Пошутить (reply)") ,
+					BotCommand("vanilla", "Ванильная философия"),
+					BotCommand("duel", "Дуэль (reply или 2 ID)"),
+					BotCommand("roulette", "Рулетка"),
+					BotCommand("profile", "Профиль (reply)") ,
+					BotCommand("search", "Саркастический обыск"),
+				]
+				await application.bot.set_my_commands(commands)
+			except Exception:
+				logger.exception("Не удалось установить команды бота")
+			# cache bot username for mention detection
+			try:
+				me = await application.bot.get_me()
+				globals()['BOT_USERNAME'] = me.username
+			except Exception:
+				globals()['BOT_USERNAME'] = None
 
 	app = Application.builder().token(token).post_init(start_backgrounds).build()
 
@@ -644,6 +769,20 @@ def main():
 
 	# message handler
 	app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), on_message))
+	# callback handler for inline buttons
+	app.add_handler(CallbackQueryHandler(commands_button_handler))
+
+	# global error handler
+	async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+		logger.exception("Unhandled exception: %s", context.error)
+		try:
+			# notify owner if possible
+			bot = context.application.bot
+			await bot.send_message(OWNER_ID, f"Ошибка в боте: {context.error}")
+		except Exception:
+			logger.exception("Не удалось уведомить владельца об ошибке")
+
+	app.add_error_handler(global_error_handler)
 
 	# chat member updates
 	app.add_handler(ChatMemberHandler(welcome_goodbye, ChatMemberHandler.CHAT_MEMBER))
