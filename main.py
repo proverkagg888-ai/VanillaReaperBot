@@ -235,69 +235,72 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	await update.message.reply_text("VanillaReaperBot at your service. Use /help for commands.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-	# user-friendly help with inline buttons
-	text = (
-		"VanillaReaperBot — команды:\n\n"
-		"Модерация: /warn /warns /mute /unmute /kick /ban /unban\n"
-		"Развлечения: используйте кнопки ниже или команды /roast /vanilla /duel /roulette\n"
-		"Профиль: /profile (reply) — посмотреть варны/муты\n"
-		"Админ-панель: /addadmin /removeadmin /setowner /admins (только владелец)\n"
-	)
-	keyboard = [
-		[InlineKeyboardButton("🔥 Roast", callback_data="roast"), InlineKeyboardButton("🍦 Vanilla", callback_data="vanilla")],
-		[InlineKeyboardButton("🎲 Roulette", callback_data="roulette"), InlineKeyboardButton("⚔️ Duel (reply)", callback_data="duel")],
-		[InlineKeyboardButton("👤 Profile (reply)", callback_data="profile"), InlineKeyboardButton("ℹ️ BotInfo", callback_data="botinfo")],
-	]
-	reply_markup = InlineKeyboardMarkup(keyboard)
-	await update.message.reply_text(text, reply_markup=reply_markup)
+	# handle inline button presses safely
+	query = update.callback_query
+	if not query:
+		return
+	await query.answer()
+	data = query.data
+	chat = query.message.chat
+	bot = context.bot
+	user = query.from_user
 
-async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-	user = update.effective_user
-	chat = update.effective_chat
-	if not is_owner(user.id):
-		return await update.message.reply_text("Только владелец может выдавать админов.")
-	if not context.args and not update.message.reply_to_message:
-		return await update.message.reply_text("Укажи пользователя через reply или @username.")
-	target = None
-	if update.message.reply_to_message:
-		target = update.message.reply_to_message.from_user
-	else:
+	if data == 'roast':
+		# roast target: prefer reply_to_message target, else the pressing user
+		if query.message.reply_to_message:
+			target = query.message.reply_to_message.from_user
+		else:
+			target = user
+		await bot.send_message(chat.id, f"{target.mention_html()} — {random.choice(ROASTS)}", parse_mode="HTML")
+	elif data == 'vanilla':
+		await bot.send_message(chat.id, random.choice(VANILLA))
+	elif data == 'roulette':
+		# roulette: pick target from reply or use pressing user
+		if query.message.reply_to_message:
+			target = query.message.reply_to_message.from_user
+		else:
+			target = user
+		# perform roulette logic inline to avoid relying on Update.message
+		roll = random.choice(["nothing", "short_mute", "long_mute", "roast", "honor", "victim"])
+		if roll == "nothing":
+			await bot.send_message(chat.id, "Колесо крутится... Ничего не получилось. Удача не для тебя.")
+		elif roll == "short_mute":
+			seconds = 30
+			until = datetime.utcnow() + timedelta(seconds=seconds)
+			ok = await try_restrict(chat.id, target.id, until, bot)
+			if not ok:
+				await bot.send_message(chat.id, "У меня нет прав мутить пользователя. Сделайте бота админом.")
+			else:
+				mutes.setdefault(chat.id, {})[target.id] = until.timestamp()
+				asyncio.create_task(schedule_unmute(context.application, chat.id, target.id, seconds))
+				await bot.send_message(chat.id, f"Колесо выбрало мут на {seconds} секунд для {target.mention_html()}.", parse_mode="HTML")
+		elif roll == "long_mute":
+			seconds = 300
+			until = datetime.utcnow() + timedelta(seconds=seconds)
+			ok = await try_restrict(chat.id, target.id, until, bot)
+			if not ok:
+				await bot.send_message(chat.id, "У меня нет прав мутить пользователя. Сделайте бота админом.")
+			else:
+				mutes.setdefault(chat.id, {})[target.id] = until.timestamp()
+				asyncio.create_task(schedule_unmute(context.application, chat.id, target.id, seconds))
+				await bot.send_message(chat.id, f"О, длинный мут: {seconds} секунд для {target.mention_html()}.", parse_mode="HTML")
+		elif roll == "roast":
+			await bot.send_message(chat.id, f"Рулетка выдала ростер: {random.choice(ROASTS)}")
+		elif roll == "honor":
+			await bot.send_message(chat.id, f"Честь дана {target.mention_html()} — минутой молчания.", parse_mode="HTML")
+		elif roll == "victim":
+			victim_of_day[chat.id] = target.id
+			await bot.send_message(chat.id, f"Жертва дня: {target.mention_html()}.", parse_mode="HTML")
+	elif data == 'duel':
+		await bot.send_message(chat.id, 'Используйте /duel в reply на сообщение или укажите 2 ID: /duel <id1> <id2>')
+	elif data == 'profile':
+		await bot.send_message(chat.id, 'Используйте /profile в reply на сообщение пользователя, чтобы увидеть профиль.')
+	elif data == 'botinfo':
+		# call botinfo; pass a fake minimal message context
 		try:
-			username = context.args[0]
-			member = await context.bot.get_chat_member(chat.id, username)
-			target = member.user
+			await botinfo_cmd(query.message, context)
 		except Exception:
-			return await update.message.reply_text("Не удалось найти пользователя.")
-	ensure_chat_structs(chat.id)
-	admins[chat.id].add(target.id)
-	await update.message.reply_text(f"{target.mention_html()} теперь админ.", parse_mode="HTML")
-
-async def removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-	user = update.effective_user
-	chat = update.effective_chat
-	if not is_owner(user.id):
-		return await update.message.reply_text("Только владелец может снимать админов.")
-	if update.message.reply_to_message:
-		target = update.message.reply_to_message.from_user
-	elif context.args:
-		try:
-			username = context.args[0]
-			member = await context.bot.get_chat_member(chat.id, username)
-			target = member.user
-		except Exception:
-			return await update.message.reply_text("Не удалось найти пользователя.")
-	else:
-		return await update.message.reply_text("Укажи пользователя через reply или @username.")
-	ensure_chat_structs(chat.id)
-	admins[chat.id].discard(target.id)
-	await update.message.reply_text(f"{target.mention_html()} больше не админ.", parse_mode="HTML")
-
-async def setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-	global OWNER_ID
-	user = update.effective_user
-	if not is_owner(user.id):
-		return await update.message.reply_text("Только владелец может передать владение.")
-	if update.message.reply_to_message:
+			logger.exception('botinfo via callback failed')
 		target = update.message.reply_to_message.from_user
 	elif context.args:
 		try:
